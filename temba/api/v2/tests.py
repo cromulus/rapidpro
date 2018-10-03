@@ -1,5 +1,4 @@
 import base64
-import json
 from datetime import datetime
 from urllib.parse import quote_plus
 from uuid import uuid4
@@ -13,10 +12,10 @@ from rest_framework.test import APIClient
 from django.conf import settings
 from django.contrib.auth.models import Group
 from django.contrib.gis.geos import GEOSGeometry
-from django.core.urlresolvers import reverse
 from django.db import connection
 from django.db.models import Q
 from django.test import override_settings
+from django.urls import reverse
 from django.utils import timezone
 
 from temba.api.models import APIToken, Resthook, WebHookEvent
@@ -29,6 +28,7 @@ from temba.locations.models import BoundaryAlias
 from temba.msgs.models import Broadcast, Label, Msg
 from temba.orgs.models import Language
 from temba.tests import AnonymousOrg, ESMockWithScroll, TembaTest
+from temba.utils import json
 from temba.values.constants import Value
 
 from . import fields
@@ -176,22 +176,22 @@ class APITest(TembaTest):
         self.assertRaises(serializers.ValidationError, field.to_internal_value, list(range(101)))  # too long
 
         field = fields.CampaignField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(campaign.uuid), campaign)
         self.assertRaises(serializers.ValidationError, field.to_internal_value, {"id": 3})  # not a string or int
 
         field = fields.CampaignEventField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(event.uuid), event)
 
-        field.context = {"org": self.org2}
+        field._context = {"org": self.org2}
 
         self.assertRaises(serializers.ValidationError, field.to_internal_value, event.uuid)
 
         field = fields.ChannelField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(self.channel.uuid), self.channel)
         self.channel.is_active = False
@@ -199,24 +199,24 @@ class APITest(TembaTest):
         self.assertRaises(serializers.ValidationError, field.to_internal_value, self.channel.uuid)
 
         field = fields.ContactField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(self.joe.uuid), self.joe)
         self.assertRaises(serializers.ValidationError, field.to_internal_value, [self.joe.uuid, self.frank.uuid])
 
         field = fields.ContactField(source="test", many=True)
-        field.child_relation.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value([self.joe.uuid, self.frank.uuid]), [self.joe, self.frank])
         self.assertRaises(serializers.ValidationError, field.to_internal_value, self.joe.uuid)
 
         field = fields.ContactGroupField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(group.uuid), group)
 
         field = fields.ContactFieldField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value("registered"), field_obj)
         self.assertRaises(serializers.ValidationError, field.to_internal_value, "xyx")
@@ -225,19 +225,20 @@ class APITest(TembaTest):
         self.assertEqual(field.to_internal_value("created_on"), field_created_on)
 
         field = fields.FlowField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value(flow.uuid), flow)
 
         field = fields.URNField(source="test")
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value("tel:+1-800-123-4567"), "tel:+18001234567")
         self.assertRaises(serializers.ValidationError, field.to_internal_value, "12345")  # un-parseable
         self.assertRaises(serializers.ValidationError, field.to_internal_value, "tel:800-123-4567")  # no country code
+        self.assertRaises(serializers.ValidationError, field.to_internal_value, 18001234567)  # non-string
 
         field = fields.TranslatableField(source="test", max_length=10)
-        field.context = {"org": self.org}
+        field._context = {"org": self.org}
 
         self.assertEqual(field.to_internal_value("Hello"), ({"base": "Hello"}, "base"))
         self.assertEqual(field.to_internal_value({"base": "Hello"}), ({"base": "Hello"}, "base"))
@@ -1194,7 +1195,7 @@ class APITest(TembaTest):
         response = self.deleteJSON(url, "uuid=%s" % event1.uuid)
         self.assertEqual(response.status_code, 204)
 
-        self.assertFalse(CampaignEvent.objects.filter(id=event1.id).exists())
+        self.assertFalse(CampaignEvent.objects.filter(id=event1.id, is_active=True).exists())
 
         # should no longer have any events
         self.assertEqual(1, EventFire.objects.filter(contact=contact, event=event2).count())
@@ -1309,7 +1310,9 @@ class APITest(TembaTest):
         contact4 = self.create_contact("Don", "0788000004", language="fra")
 
         contact1.set_field(self.user, "nickname", "Annie", label="Nick name")
+        contact1.set_field(self.user, "gender", "female", label="Gender")
         contact4.set_field(self.user, "nickname", "Donnie", label="Nick name")
+        contact4.set_field(self.user, "gender", "male", label="Gender")
 
         contact1.stop(self.user)
         contact2.block(self.user)
@@ -1328,7 +1331,7 @@ class APITest(TembaTest):
         hans = self.create_contact("Hans", "0788000004", org=self.org2)
 
         # no filtering
-        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 5):
+        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 4):
             response = self.fetchJSON(url)
 
         resp_json = response.json()
@@ -1343,7 +1346,7 @@ class APITest(TembaTest):
                 "language": "fra",
                 "urns": ["tel:+250788000004"],
                 "groups": [{"uuid": group.uuid, "name": group.name}],
-                "fields": {"nickname": "Donnie"},
+                "fields": {"nickname": "Donnie", "gender": "male"},
                 "blocked": False,
                 "stopped": False,
                 "created_on": format_datetime(contact4.created_on),
@@ -1420,7 +1423,7 @@ class APITest(TembaTest):
                 "language": None,
                 "urns": [],
                 "groups": [],
-                "fields": {"nickname": None},
+                "fields": {"nickname": None, "gender": None},
                 "blocked": False,
                 "stopped": False,
                 "created_on": format_datetime(empty.created_on),
@@ -1439,6 +1442,11 @@ class APITest(TembaTest):
 
         with ESMockWithScroll():
             dyn_group = self.create_group("Dynamic Group", query="nickname is jado")
+
+            lang_group = self.create_group("Language Group", query="language = fra")
+            eng_lang_group = self.create_group("Language Group English", query="language = eng")
+
+            jason_group = self.create_group("Jason Group", query="name has Jason")
 
         # create with all fields
         response = self.postJSON(
@@ -1459,9 +1467,10 @@ class APITest(TembaTest):
 
         # URNs will be normalized
         nickname = ContactField.get_by_key(self.org, "nickname")
+        gender = ContactField.get_by_key(self.org, "gender")
         jean = Contact.objects.filter(name="Jean", language="fra").order_by("-pk").first()
         self.assertEqual(set(jean.urns.values_list("identity", flat=True)), {"tel:+250783333333", "twitter:jean"})
-        self.assertEqual(set(jean.user_groups.all()), {group, dyn_group})
+        self.assertEqual(set(jean.user_groups.all()), {group, dyn_group, lang_group})
         self.assertEqual(jean.get_field_value(nickname), "Jado")
 
         # create with invalid fields
@@ -1477,11 +1486,12 @@ class APITest(TembaTest):
             },
         )
         self.assertResponseError(response, "language", "Ensure this field has no more than 3 characters.")
-        self.assertResponseError(
-            response, "urns", "Invalid URN: 1234556789. Ensure phone numbers contain country codes."
-        )
         self.assertResponseError(response, "groups", "No such object: 59686b4e-14bc-4160-9376-b649b218c806")
         self.assertResponseError(response, "fields", "Invalid contact field key: hmmm")
+
+        self.assertEqual(
+            response.json()["urns"], {"0": ["Invalid URN: 1234556789. Ensure phone numbers contain country codes."]}
+        )
 
         # update an existing contact by UUID but don't provide any fields
         response = self.postJSON(url, "uuid=%s" % jean.uuid, {})
@@ -1492,29 +1502,84 @@ class APITest(TembaTest):
         self.assertEqual(jean.name, "Jean")
         self.assertEqual(jean.language, "fra")
         self.assertEqual(set(jean.urns.values_list("identity", flat=True)), {"tel:+250783333333", "twitter:jean"})
-        self.assertEqual(set(jean.user_groups.all()), {group, dyn_group})
+        self.assertEqual(set(jean.user_groups.all()), {group, dyn_group, lang_group})
         self.assertEqual(jean.get_field_value(nickname), "Jado")
 
         # update by UUID and change all fields
+        with self.assertNumQueries(72):
+            response = self.postJSON(
+                url,
+                "uuid=%s" % jean.uuid,
+                {
+                    "name": "Jason Undead",
+                    "language": "ita",
+                    "urns": ["tel:+250784444444"],
+                    "groups": [],
+                    "fields": {"nickname": "Žan", "gender": "frog"},
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+
+        jean = Contact.objects.get(pk=jean.pk)
+        self.assertEqual(jean.name, "Jason Undead")
+        self.assertEqual(jean.language, "ita")
+        self.assertEqual(set(jean.urns.values_list("identity", flat=True)), {"tel:+250784444444"})
+        self.assertEqual(set(jean.user_groups.all()), {jason_group})
+        self.assertEqual(jean.get_field_value(nickname), "Žan")
+        self.assertEqual(jean.get_field_value(gender), "frog")
+
+        # change the language field
         response = self.postJSON(
             url,
             "uuid=%s" % jean.uuid,
-            {
-                "name": "Jean II",
-                "language": "eng",
-                "urns": ["tel:+250784444444"],
-                "groups": [],
-                "fields": {"nickname": "John"},
-            },
+            {"name": "Jean II", "language": "eng", "urns": ["tel:+250784444444"], "groups": [], "fields": {}},
         )
         self.assertEqual(response.status_code, 200)
-
         jean = Contact.objects.get(pk=jean.pk)
         self.assertEqual(jean.name, "Jean II")
         self.assertEqual(jean.language, "eng")
         self.assertEqual(set(jean.urns.values_list("identity", flat=True)), {"tel:+250784444444"})
-        self.assertEqual(set(jean.user_groups.all()), set())
-        self.assertEqual(jean.get_field_value(nickname), "John")
+        self.assertEqual(set(jean.user_groups.all()), {eng_lang_group})
+        self.assertEqual(jean.get_field_value(nickname), "Žan")
+
+        # update by uuid and remove all fields
+        with self.assertNumQueries(28):
+            response = self.postJSON(
+                url,
+                "uuid=%s" % jean.uuid,
+                {
+                    "name": "Jean II",
+                    "language": "eng",
+                    "urns": ["tel:+250784444444"],
+                    "groups": [],
+                    "fields": {"nickname": "", "gender": ""},
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+
+        jean = Contact.objects.get(pk=jean.pk)
+        self.assertEqual(jean.get_field_value(nickname), None)
+        self.assertEqual(jean.get_field_value(gender), None)
+
+        # update by uuid and update/remove fields
+        with self.assertNumQueries(35):
+            response = self.postJSON(
+                url,
+                "uuid=%s" % jean.uuid,
+                {
+                    "name": "Jean II",
+                    "language": "eng",
+                    "urns": ["tel:+250784444444"],
+                    "groups": [],
+                    "fields": {"nickname": "Jado", "gender": ""},
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+
+        jean = Contact.objects.get(pk=jean.pk)
+        self.assertEqual(jean.get_field_value(nickname), "Jado")
+        self.assertEqual(jean.get_field_value(gender), None)
+        self.assertEqual(set(jean.user_groups.all()), {eng_lang_group, dyn_group})
 
         # update by URN (which should be normalized)
         response = self.postJSON(url, "urn=%s" % quote_plus("tel:+250-78-4444444"), {"name": "Jean III"})
@@ -1584,6 +1649,9 @@ class APITest(TembaTest):
 
         jean.refresh_from_db()
         self.assertFalse(jean.is_active)
+
+        response = self.postJSON(url, "uuid=%s" % jean.uuid, {})
+        self.assertResponseError(response, "non_field_errors", "Inactive contacts can't be modified.")
 
         # create xavier
         response = self.postJSON(url, None, {"name": "Xavier", "urns": ["tel:+250-78-7777777", "twitter:XAVIER"]})
@@ -2681,7 +2749,7 @@ class APITest(TembaTest):
         # allow Frank to run the flow in French
         self.org.set_languages(self.admin, ["eng", "fra"], "eng")
         self.frank.language = "fra"
-        self.frank.save(update_fields=("language",))
+        self.frank.save(update_fields=("language",), handle_update=False)
 
         flow1 = self.get_flow("color")
         flow2 = Flow.copy(flow1, self.user)
@@ -3202,6 +3270,38 @@ class APITest(TembaTest):
         # try to start a flow with no contact/group/URN
         response = self.postJSON(url, None, dict(flow=flow.uuid, restart_participants=True))
         self.assertResponseError(response, "non_field_errors", "Must specify at least one group, contact or URN")
+
+        # should raise validation error for invalid JSON in extra
+        response = self.postJSON(
+            url,
+            None,
+            dict(
+                urns=["tel:+12067791212"],
+                contacts=[self.joe.uuid],
+                groups=[hans_group.uuid],
+                flow=flow.uuid,
+                restart_participants=False,
+                extra="YES",
+            ),
+        )
+
+        self.assertResponseError(response, "extra", "Must be a valid JSON value")
+
+        # a list is valid JSON, but extra has to be a dict
+        response = self.postJSON(
+            url,
+            None,
+            dict(
+                urns=["tel:+12067791212"],
+                contacts=[self.joe.uuid],
+                groups=[hans_group.uuid],
+                flow=flow.uuid,
+                restart_participants=False,
+                extra=[],
+            ),
+        )
+
+        self.assertResponseError(response, "extra", "Must be a valid JSON value")
 
         # invalid URN
         response = self.postJSON(

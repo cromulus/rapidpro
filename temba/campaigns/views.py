@@ -2,8 +2,8 @@ from smartmin.views import SmartCreateView, SmartCRUDL, SmartDeleteView, SmartLi
 
 from django import forms
 from django.core.exceptions import ValidationError
-from django.core.urlresolvers import reverse
 from django.http import HttpResponseRedirect
+from django.urls import reverse
 from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
@@ -70,7 +70,7 @@ class CampaignCRUDL(SmartCRUDL):
     class OrgMixin(OrgPermsMixin):
         def derive_queryset(self, *args, **kwargs):
             queryset = super().derive_queryset(*args, **kwargs)
-            if not self.request.user.is_authenticated():  # pragma: no cover
+            if not self.request.user.is_authenticated:  # pragma: no cover
                 return queryset.exclude(pk__gt=0)
             else:
                 return queryset.filter(org=self.request.user.get_org())
@@ -266,7 +266,7 @@ class CampaignEventForm(forms.ModelForm):
                 iso_code = language.language["iso_code"]
                 translations[iso_code] = self.cleaned_data.get(iso_code, "")
 
-            if not obj.flow_id or not obj.flow.is_active or obj.flow.flow_type != Flow.MESSAGE:
+            if not obj.flow_id or not obj.flow.is_active or not obj.flow.is_system:
                 obj.flow = Flow.create_single_message(org, request.user, translations, base_language=base_language)
             else:
                 # set our single message on our flow
@@ -292,7 +292,11 @@ class CampaignEventForm(forms.ModelForm):
 
         flow = self.fields["flow_to_start"]
         flow.queryset = Flow.objects.filter(
-            org=self.user.get_org(), flow_type__in=[Flow.FLOW, Flow.VOICE], is_active=True, is_archived=False
+            org=self.user.get_org(),
+            flow_type__in=[Flow.TYPE_MESSAGE, Flow.TYPE_VOICE],
+            is_active=True,
+            is_archived=False,
+            is_system=False,
         ).order_by("name")
 
         message = self.instance.message or {}

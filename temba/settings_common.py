@@ -52,6 +52,9 @@ AWS_STORAGE_BUCKET_NAME = "dl-temba-io"
 AWS_BUCKET_DOMAIN = AWS_STORAGE_BUCKET_NAME + ".s3.amazonaws.com"
 STORAGE_ROOT_DIR = "test_orgs" if TESTING else "orgs"
 
+# bucket where archives files are stored
+ARCHIVE_BUCKET = "dl-temba-archives"
+
 # keys to access s3
 AWS_ACCESS_KEY_ID = "aws_access_key_id"
 AWS_SECRET_ACCESS_KEY = "aws_secret_access_key"
@@ -160,7 +163,6 @@ TEMPLATES = [
                 "temba.utils.haml.HamlAppDirectoriesLoader",
                 "django.template.loaders.filesystem.Loader",
                 "django.template.loaders.app_directories.Loader",
-                "django.template.loaders.eggs.Loader",
             ],
             "debug": False if TESTING else DEBUG,
         },
@@ -170,7 +172,7 @@ TEMPLATES = [
 if TESTING:
     TEMPLATES[0]["OPTIONS"]["context_processors"] += ("temba.tests.add_testing_flag_to_context",)
 
-MIDDLEWARE_CLASSES = (
+MIDDLEWARE = (
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -287,7 +289,7 @@ BRANDING = {
         "splash": "brands/rapidpro/splash.jpg",
         "logo": "brands/rapidpro/logo.png",
         "allow_signups": True,
-        "flow_types": ["F", "V", "S", "U"],  # see Flow.FLOW, Flow.VOICE, Flow.SURVEY, Flow.USSD
+        "flow_types": ["M", "V", "S", "U"],  # see Flow.TYPE_MESSAGE, Flow.TYPE_VOICE, Flow.TYPE_SURVEY, Flow.TYPE_USSD
         "tiers": dict(import_flows=0, multi_user=0, multi_org=0),
         "bundles": [],
         "welcome_packs": [dict(size=5000, name="Demo Account"), dict(size=100000, name="UNICEF Account")],
@@ -905,9 +907,11 @@ REST_FRAMEWORK = {
         "v2.api": "2500/hour",
     },
     "PAGE_SIZE": 250,
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
     "DEFAULT_RENDERER_CLASSES": ("temba.api.support.DocumentationRenderer", "rest_framework.renderers.JSONRenderer"),
     "EXCEPTION_HANDLER": "temba.api.support.temba_exception_handler",
     "UNICODE_JSON": False,
+    "STRICT_JSON": False,
 }
 REST_HANDLE_EXCEPTIONS = not TESTING
 
@@ -1008,6 +1012,7 @@ CHANNEL_TYPES = [
     "temba.channels.types.mtarget.MtargetType",
     "temba.channels.types.mblox.MbloxType",
     "temba.channels.types.messangi.MessangiType",
+    "temba.channels.types.novo.NovoType",
     "temba.channels.types.plivo.PlivoType",
     "temba.channels.types.redrabbit.RedRabbitType",
     "temba.channels.types.shaqodoon.ShaqodoonType",
