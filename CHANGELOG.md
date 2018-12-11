@@ -1,3 +1,162 @@
+v4.13.2
+----------
+ * create empty revisions for empty flows
+ * proper handle of empty errors on index page
+ * fix error for policy read URL failing
+ * add quick replies to mailroom simulator
+
+v4.13.1
+----------
+ * populate simulator environment for triggers and resumes
+ * honour Flow.is_active on the Web view
+ * fix android channel release to not throw if no FCM ID
+ * add Play Mobile aggregator
+
+v4.13.0
+----------
+ * Add index for fast Android channel fetch by last seen
+ * Remove gcm_id field
+ * No messages sheet for flow results export on anon orgs
+ * Add periodic task to sync channels we have not seen for a while
+ * Add wait_started_on field to flow session
+
+v4.12.6
+----------
+ * Remove flow server trialling
+ * Replace tab characters for GSM7
+ * Use mailroom on messaging flows for simulation
+ * Raise ValidationError for ContactFields with null chars
+ * upgrade to Django 2.1
+
+v4.12.5
+----------
+ * Make sure Flow.update clears prefetched nodes after potentialy deleting them
+
+v4.12.4
+----------
+ * Fix Flow.update not deleting nodes properly when they change type
+
+v4.12.3
+----------
+ * Add try/except block on FCM sync
+ * Issue #828, remove numbers replace
+
+v4.12.2
+----------
+ * Dont show queued scheduled broadcasts in outbox
+ * Prevent deleting groups with active campaigns
+ * Activate support for media attachment for Twitter channels
+ * Remove ability to create webhook actions in editor
+ * Add flow migration to replace webhook actions with rulesets
+
+v4.12.1
+----------
+ * Fix importing campaign events based on created_om
+ * Fix event fires creation for immutable fields
+ * Remove WA status endpoint
+ * Fix IVR runs expiration date initialization
+ * Add UUID field to org
+
+v4.11.7
+----------
+ * Interrupt old IVR calls and related flow sessions
+ * Move webhook docs button from the token view to the webhook view
+
+v4.11.6
+----------
+ * Faster squashing
+ * Fix EX bulk sender form fields
+
+v4.11.5
+----------
+ * simulate flow_server_enabled flows in mailroom
+
+v4.11.3
+----------
+ * Add session log links to contact history for staff users
+ * Hide old webhook config page if not yet set
+
+v4.11.2
+----------
+ * Fix passing false/true to archived param of flows API endpoint
+
+v4.11.1
+----------
+ * Turn on the attachment support for VP channels
+ * Tweak 11.6 flow migration so that we remap groups, but never create them
+ * Flows API endpoint should support filtering by archived and type
+ * Log how many flow sessions are deleted and the time taken
+ * Turn on the attachment support for WA channels
+ * Adjust UI for adding quick replies and attachment in random order
+
+v4.11.0
+----------
+ * Add index for fetching waiting sessions by contact
+ * Ensure test_db users have same username and email
+ * Add index to FlowSession.ended_on
+ * Make FlowSession.created_on non-null
+ * Add warning class to skipped campaigns event fire on contact history
+ * Add fired_result field to campaign event fires
+
+v4.10.9
+----------
+ * Log and fail calls that cannot be started
+ * Allow contact.created_on in flows, init new event
+
+v4.10.8
+----------
+ * Deactivate events when updating campaigns
+ * Less aggressive event fire recreation
+ * Use SMTP SERVER org config and migrate old config keys
+
+v4.10.4
+----------
+ * Retry failed IVR calls
+
+v4.10.3
+----------
+ * Show all split types on run results, use elastic for searching
+
+v4.10.2
+----------
+ * Flow migration for mismatched group uuids in existing flows
+ * Remap group uuids on flow import
+ * Migration to backfill FlowSession.created_on / ended_on
+
+v4.10.1
+----------
+ * Add config to specify content that should be present in the response of the request, if not mark that as msg failed
+ * Allow campaign events to be skipped if contacts already active in flows
+
+v4.10.0
+----------
+ * Add FlowRun.parent_uuid
+ * Add FlowSession.timeout_on
+ * Create new flows with flow_server_enabled when org is enabled
+ * Add flow-server-enabled to org, dont deal with flow server enabled timeouts or expirations on rapidpro
+
+v4.9.2
+----------
+ * Fix flowserver resume tests by including modified_on on runs sent to goflow
+
+v4.9.1
+----------
+ * Dont set preferred channels if they can't send or call
+ * Don't assume events from goflow have step_uuid
+ * Add indexes for flow node and category count squashing
+
+v4.9.0
+----------
+ * Delete event fires in bulk for inactive events
+ * Fix using contact language for categories when it's not a valid org language
+ * Fix translation of quick replies
+ * Add FlowSession.current_flow and start populating
+ * Refresh contacts list page after managing fields
+ * Update to latest goflow (no more caller events, resumes, etc)
+ * Fix flow results export to read old archive format
+ * Batch event fires by event ID and not by flow ID
+ * Make campaign events immutable
+
 v4.8.1
 ----------
  * Add novo channel
