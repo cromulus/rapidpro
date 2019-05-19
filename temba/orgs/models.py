@@ -296,6 +296,10 @@ class Org(SmartModel):
         default=False, help_text=_("Whether flows and messages should be handled by the flow server")
     )
 
+    webhooks_enabled = models.BooleanField(
+        default=False, help_text=_("Whether Org can configure RapidPro to send new events to their application")
+    )
+
     parent = models.ForeignKey(
         "orgs.Org",
         on_delete=models.PROTECT,
