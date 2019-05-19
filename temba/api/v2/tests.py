@@ -1,11 +1,11 @@
 import base64
 from datetime import datetime
+from unittest.mock import patch
 from urllib.parse import quote_plus
 from uuid import uuid4
 
 import iso8601
 import pytz
-from mock import patch
 from rest_framework import serializers
 from rest_framework.test import APIClient
 
@@ -27,6 +27,7 @@ from temba.flows.models import ActionSet, Flow, FlowLabel, FlowRun, FlowStart, R
 from temba.locations.models import BoundaryAlias
 from temba.msgs.models import Broadcast, Label, Msg
 from temba.orgs.models import Language
+from temba.templates.models import TemplateTranslation
 from temba.tests import AnonymousOrg, ESMockWithScroll, TembaTest
 from temba.triggers.models import Trigger
 from temba.utils import json
@@ -44,7 +45,6 @@ class APITest(TembaTest):
 
         self.joe = self.create_contact("Joe Blow", "0788123123")
         self.frank = self.create_contact("Frank", twitter="franky")
-        self.test_contact = Contact.get_test_contact(self.user)
 
         self.twitter = Channel.create(
             self.org, self.user, None, "TT", name="Twitter Channel", address="billy_bob", role="SR"
@@ -52,6 +52,8 @@ class APITest(TembaTest):
 
         self.create_secondary_org()
         self.hans = self.create_contact("Hans Gruber", "+4921551511", org=self.org2)
+
+        self.org2channel = Channel.create(self.org2, self.user, "RW", "A", name="Org2Channel")
 
         self.maxDiff = None
 
@@ -236,7 +238,7 @@ class APITest(TembaTest):
         self.assertEqual(field.to_internal_value("tel:+1-800-123-4567"), "tel:+18001234567")
         self.assertRaises(serializers.ValidationError, field.to_internal_value, "12345")  # un-parseable
         self.assertRaises(serializers.ValidationError, field.to_internal_value, "tel:800-123-4567")  # no country code
-        self.assertRaises(serializers.ValidationError, field.to_internal_value, 18001234567)  # non-string
+        self.assertRaises(serializers.ValidationError, field.to_internal_value, 18_001_234_567)  # non-string
 
         field = fields.TranslatableField(source="test", max_length=10)
         field._context = {"org": self.org}
@@ -624,6 +626,7 @@ class APITest(TembaTest):
                 "contacts": [{"uuid": self.joe.uuid, "name": self.joe.name}],
                 "groups": [{"uuid": reporters.uuid, "name": reporters.name}],
                 "text": {"base": "Hello 4"},
+                "status": "failed",
                 "created_on": format_datetime(bcast4.created_on),
             },
         )
@@ -2002,7 +2005,6 @@ class APITest(TembaTest):
         contact5 = self.create_contact("Eve", "+250788000005")  # a deleted contact
         contact4.block(self.user)
         contact5.release(self.user)
-        test_contact = Contact.get_test_contact(self.user)
 
         group = self.create_group("Testers")
         self.create_field("isdeveloper", "Is developer")
@@ -2030,14 +2032,7 @@ class APITest(TembaTest):
             url,
             None,
             {
-                "contacts": [
-                    contact1.uuid,
-                    "tel:+250788000002",
-                    contact3.uuid,
-                    contact4.uuid,
-                    contact5.uuid,
-                    test_contact.uuid,
-                ],
+                "contacts": [contact1.uuid, "tel:+250788000002", contact3.uuid, contact4.uuid, contact5.uuid],
                 "action": "add",
                 "group": "Testers",
             },
@@ -2102,18 +2097,7 @@ class APITest(TembaTest):
         response = self.postJSON(url, None, {"contacts": [contact1.uuid], "action": "add", "group": ""})
         self.assertResponseError(response, "group", "This field may not be null.")
 
-        # try to block all contacts
-        response = self.postJSON(
-            url,
-            None,
-            {
-                "contacts": [contact1.uuid, contact2.uuid, contact3.uuid, contact4.uuid, test_contact.uuid],
-                "action": "block",
-            },
-        )
-        self.assertResponseError(response, "contacts", "No such object: %s" % test_contact.uuid)
-
-        # block all valid contacts
+        # block all contacts
         response = self.postJSON(
             url, None, {"contacts": [contact1.uuid, contact2.uuid, contact3.uuid, contact4.uuid], "action": "block"}
         )
@@ -2123,7 +2107,7 @@ class APITest(TembaTest):
         # unblock contact 1
         response = self.postJSON(url, None, {"contacts": [contact1.uuid], "action": "unblock"})
         self.assertEqual(response.status_code, 204)
-        self.assertEqual(set(Contact.objects.filter(is_blocked=False)), {contact1, contact5, test_contact})
+        self.assertEqual(set(Contact.objects.filter(is_blocked=False)), {contact1, contact5})
         self.assertEqual(set(Contact.objects.filter(is_blocked=True)), {contact2, contact3, contact4})
 
         # interrupt any active runs of contacts 1 and 2
@@ -2148,7 +2132,7 @@ class APITest(TembaTest):
         response = self.postJSON(url, None, {"contacts": [contact1.uuid, contact2.uuid], "action": "delete"})
         self.assertEqual(response.status_code, 204)
         self.assertEqual(set(Contact.objects.filter(is_active=False)), {contact1, contact2, contact5})
-        self.assertEqual(set(Contact.objects.filter(is_active=True)), {contact3, contact4, test_contact})
+        self.assertEqual(set(Contact.objects.filter(is_active=True)), {contact3, contact4})
         self.assertFalse(Msg.objects.filter(contact__in=[contact1, contact2]).exclude(visibility="D").exists())
         self.assertTrue(Msg.objects.filter(contact=contact3).exclude(visibility="D").exists())
 
@@ -2800,9 +2784,6 @@ class APITest(TembaTest):
         # add a deleted message
         deleted_msg = self.create_msg(direction="I", msg_type="I", text="!@$!%", contact=self.frank, visibility="D")
 
-        # add a test contact message
-        self.create_msg(direction="I", msg_type="F", text="Hello", contact=self.test_contact)
-
         # add message in other org
         self.create_msg(direction="I", msg_type="I", text="Guten tag!", contact=self.hans, org=self.org2)
 
@@ -2824,7 +2805,7 @@ class APITest(TembaTest):
         )
 
         # filter by inbox
-        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 6):
+        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 5):
             response = self.fetchJSON(url, "folder=INBOX")
 
         resp_json = response.json()
@@ -2836,7 +2817,7 @@ class APITest(TembaTest):
         )
 
         # filter by incoming, should get deleted messages too
-        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 6):
+        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 5):
             response = self.fetchJSON(url, "folder=incoming")
 
         resp_json = response.json()
@@ -3008,11 +2989,7 @@ class APITest(TembaTest):
                 location = response.json().get("location", None)
                 self.assertIsNotNone(location)
 
-                starts_with = "https://%s/%s/%d/media/" % (
-                    settings.AWS_BUCKET_DOMAIN,
-                    settings.STORAGE_ROOT_DIR,
-                    self.org.pk,
-                )
+                starts_with = f"{settings.STORAGE_URL}/{settings.STORAGE_ROOT_DIR}/{self.org.id}/media/"
                 self.assertEqual(starts_with, location[0 : len(starts_with)])
                 self.assertEqual(".%s" % ext, location[-4:])
 
@@ -3052,11 +3029,6 @@ class APITest(TembaTest):
         frank_run2, = flow1.start([], [self.frank], restart_participants=True)
         joe_run3, = flow2.start([], [self.joe], restart_participants=True)
 
-        # add a test contact run
-        Contact.set_simulation(True)
-        flow2.start([], [self.test_contact])
-        Contact.set_simulation(False)
-
         # add a run for another org
         flow3 = self.create_flow(org=self.org2, user=self.admin2)
         flow3.start([], [self.hans])
@@ -3068,7 +3040,7 @@ class APITest(TembaTest):
         frank_run2.refresh_from_db()
 
         # no filtering
-        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 5):
+        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 4):
             response = self.fetchJSON(url)
 
         self.assertEqual(response.status_code, 200)
@@ -3308,9 +3280,13 @@ class APITest(TembaTest):
         self.assertEqual(set(Msg.objects.filter(visibility=Msg.VISIBILITY_ARCHIVED)), {msg3})
         self.assertFalse(Msg.objects.filter(id=msg2.id).exists())
 
-        # try to act on a deleted message
-        response = self.postJSON(url, None, {"messages": [msg2.id], "action": "restore"})
-        self.assertResponseError(response, "messages", "No such object: %d" % msg2.id)
+        # try to act on a a valid message and a deleted message
+        response = self.postJSON(url, None, {"messages": [msg2.id, msg3.id], "action": "restore"})
+
+        # should get a partial success
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"failures": [msg2.id]})
+        self.assertEqual(set(Msg.objects.filter(visibility=Msg.VISIBILITY_VISIBLE)), {msg1, msg3})
 
         # try to act on an outgoing message
         msg4 = Msg.create_outgoing(self.org, self.user, self.joe, "Hi Joe")
@@ -3453,16 +3429,12 @@ class APITest(TembaTest):
             resthook=resthook1,
             event="F",
             data=dict(event="new mother", values=dict(name="Greg"), steps=dict(uuid="abcde")),
-            created_by=self.admin,
-            modified_by=self.admin,
         )
         event2 = WebHookEvent.objects.create(
             org=self.org,
             resthook=resthook2,
             event="F",
             data=dict(event="new father", values=dict(name="Yo"), steps=dict(uuid="12345")),
-            created_by=self.admin,
-            modified_by=self.admin,
         )
 
         # no filtering
@@ -3651,3 +3623,58 @@ class APITest(TembaTest):
         # check filtering by id (deprecated)
         response = self.fetchJSON(url, "id=%d" % start2.id)
         self.assertResultsById(response, [start2])
+
+    def test_templates(self):
+        url = reverse("api.v2.templates")
+        self.assertEndpointAccess(url)
+
+        # create some templates
+        TemplateTranslation.get_or_create(
+            self.channel, "hello", "eng", "Hi {{1}}", 1, TemplateTranslation.STATUS_APPROVED, "1234"
+        )
+        tt = TemplateTranslation.get_or_create(
+            self.channel, "hello", "fra", "Bonjour {{1}}", 1, TemplateTranslation.STATUS_PENDING, "5678"
+        )
+
+        # templates on other org to test filtering
+        TemplateTranslation.get_or_create(
+            self.org2channel, "goodbye", "eng", "Goodbye {{1}}", 1, TemplateTranslation.STATUS_APPROVED, "1234"
+        )
+        TemplateTranslation.get_or_create(
+            self.org2channel, "goodbye", "fra", "Salut {{1}}", 1, TemplateTranslation.STATUS_PENDING, "5678"
+        )
+
+        # no filtering
+        with self.assertNumQueries(NUM_BASE_REQUEST_QUERIES + 3):
+            response = self.fetchJSON(url)
+
+        resp_json = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(resp_json["next"], None)
+        self.assertEqual(
+            resp_json["results"],
+            [
+                {
+                    "name": "hello",
+                    "uuid": str(tt.template.uuid),
+                    "translations": [
+                        {
+                            "language": "eng",
+                            "content": "Hi {{1}}",
+                            "variable_count": 1,
+                            "status": "approved",
+                            "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
+                        },
+                        {
+                            "language": "fra",
+                            "content": "Bonjour {{1}}",
+                            "variable_count": 1,
+                            "status": "pending",
+                            "channel": {"name": self.channel.name, "uuid": self.channel.uuid},
+                        },
+                    ],
+                    "created_on": format_datetime(tt.template.created_on),
+                    "modified_on": format_datetime(tt.template.modified_on),
+                }
+            ],
+        )

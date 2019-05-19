@@ -8,6 +8,7 @@ from functools import cmp_to_key
 from urllib.parse import parse_qs, unquote, urlparse
 
 import nexmo
+import pytz
 import requests
 from smartmin.views import (
     SmartCreateView,
@@ -52,7 +53,9 @@ from temba.formax import FormaxMixin
 from temba.utils import analytics, get_anonymous_user, json, languages
 from temba.utils.email import is_valid_address
 from temba.utils.http import http_headers
+from temba.utils.text import random_string
 from temba.utils.timezones import TimeZoneFormField
+from temba.utils.views import NonAtomicMixin
 
 from .models import (
     ACCOUNT_SID,
@@ -63,6 +66,7 @@ from .models import (
     CHATBASE_VERSION,
     MO_CALL_EVENTS,
     MO_SMS_EVENTS,
+    MONTHFIRST,
     MT_CALL_EVENTS,
     MT_SMS_EVENTS,
     NEXMO_KEY,
@@ -580,7 +584,7 @@ class OrgCRUDL(SmartCRUDL):
 
     model = Org
 
-    class Import(InferOrgMixin, OrgPermsMixin, SmartFormView):
+    class Import(NonAtomicMixin, InferOrgMixin, OrgPermsMixin, SmartFormView):
         class FlowImportForm(Form):
             import_file = forms.FileField(help_text=_("The import file"))
             update = forms.BooleanField(help_text=_("Update all flows and campaigns"), required=False)
@@ -666,6 +670,10 @@ class OrgCRUDL(SmartCRUDL):
             context["archived"] = include_archived
             context["buckets"] = buckets
             context["singles"] = singles
+
+            context["flow_id"] = int(self.request.GET.get("flow", 0))
+            context["campaign_id"] = int(self.request.GET.get("campaign", 0))
+
             return context
 
         def generate_export_buckets(self, org, include_archived):
@@ -1254,10 +1262,17 @@ class OrgCRUDL(SmartCRUDL):
                 return HttpResponseRedirect(self.get_success_url())
             return super().post(request, *args, **kwargs)
 
+        def pre_save(self, obj):
+            # figure out what our previous value was
+            obj.was_flow_server_enabled = Org.objects.get(id=obj.id).flow_server_enabled
+            return super().pre_save(obj)
+
         def post_save(self, obj):
-            # make sure all our flows have flow server enabled according to the org settings
-            if obj.flow_server_enabled:
-                obj.flows.update(flow_server_enabled=True)
+            # if we are being changed to flow server enabled, do so
+            if not obj.was_flow_server_enabled and obj.flow_server_enabled:
+                obj.enable_flow_server()
+
+            return super().post_save(obj)
 
     class Accounts(InferOrgMixin, OrgPermsMixin, SmartUpdateView):
         class PasswordForm(forms.ModelForm):
@@ -1395,6 +1410,8 @@ class OrgCRUDL(SmartCRUDL):
 
                         invitation.user_group = invite_group
                         invitation.is_active = True
+                        # generate new secret for this invitation
+                        invitation.secret = random_string(64)
                         invitation.save()
                     else:
                         invitation = Invitation.create(org, self.request.user, email, invite_group)
@@ -1419,7 +1436,7 @@ class OrgCRUDL(SmartCRUDL):
                 current_group = current_groups.get(user)
                 new_group = new_groups.get(user)
 
-                if current_group != new_group:
+                if user in self.fields_by_users and current_group != new_group:
                     if current_group:
                         self.org_group_set(org, current_group).remove(user)
                     if new_group:
@@ -1560,7 +1577,7 @@ class OrgCRUDL(SmartCRUDL):
         def get_created_by(self, obj):  # pragma: needs cover
             return "%s %s - %s" % (obj.created_by.first_name, obj.created_by.last_name, obj.created_by.email)
 
-    class CreateSubOrg(MultiOrgMixin, ModalMixin, InferOrgMixin, SmartCreateView):
+    class CreateSubOrg(NonAtomicMixin, MultiOrgMixin, ModalMixin, InferOrgMixin, SmartCreateView):
         class CreateOrgForm(forms.ModelForm):
             name = forms.CharField(label=_("Organization"), help_text=_("The name of your organization"))
 
@@ -1959,7 +1976,7 @@ class OrgCRUDL(SmartCRUDL):
             else:
                 return super().get_template_names()
 
-    class Grant(SmartCreateView):
+    class Grant(NonAtomicMixin, SmartCreateView):
         title = _("Create Organization Account")
         form_class = OrgGrantForm
         fields = ("first_name", "last_name", "email", "password", "name", "timezone", "credits")
@@ -2001,6 +2018,10 @@ class OrgCRUDL(SmartCRUDL):
             slug = Org.get_unique_slug(self.form.cleaned_data["name"])
             obj.slug = slug
             obj.brand = self.request.branding.get("host", settings.DEFAULT_BRAND)
+
+            if obj.timezone.zone in pytz.country_timezones("US"):
+                obj.date_format = MONTHFIRST
+
             return obj
 
         def get_welcome_size(self):  # pragma: needs cover

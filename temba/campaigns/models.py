@@ -234,7 +234,7 @@ class Campaign(TembaModel):
             if evt.flow.is_system:
                 evt.flow.ensure_current_version()
 
-        return sorted(events, key=lambda e: e.relative_to.pk * 100000 + e.minute_offset())
+        return sorted(events, key=lambda e: e.relative_to.pk * 100_000 + e.minute_offset())
 
     def __str__(self):
         return self.name
@@ -588,9 +588,7 @@ class EventFire(Model):
         contacts = [f.contact for f in fires]
         event = fires[0].event
 
-        include_active = not (
-            event.event_type == CampaignEvent.TYPE_MESSAGE and event.start_mode == CampaignEvent.MODE_SKIP
-        )
+        include_active = event.start_mode != CampaignEvent.MODE_SKIP
         if event.is_active and not event.campaign.is_archived:
             if len(contacts) == 1:
                 flow.start(
@@ -635,16 +633,11 @@ class EventFire(Model):
             if field.field_type == ContactField.FIELD_TYPE_USER:
                 field_uuid = str(field.uuid)
 
-                contacts = (
-                    event.campaign.group.contacts.filter(is_active=True, is_blocked=False)
-                    .exclude(is_test=True)
-                    .extra(
-                        where=['%s::text[] <@ (extract_jsonb_keys("contacts_contact"."fields"))'],
-                        params=[[field_uuid]],
-                    )
+                contacts = event.campaign.group.contacts.filter(is_active=True, is_blocked=False).extra(
+                    where=['%s::text[] <@ (extract_jsonb_keys("contacts_contact"."fields"))'], params=[[field_uuid]]
                 )
             elif field.field_type == ContactField.FIELD_TYPE_SYSTEM:
-                contacts = event.campaign.group.contacts.filter(is_active=True, is_blocked=False).exclude(is_test=True)
+                contacts = event.campaign.group.contacts.filter(is_active=True, is_blocked=False)
             else:  # pragma: no cover
                 raise ValueError(f"Unhandled ContactField type {field.field_type}.")
 
@@ -662,49 +655,6 @@ class EventFire(Model):
 
             # bulk create our event fires
             EventFire.objects.bulk_create(events)
-
-    @classmethod
-    def update_field_events(cls, contact_field):
-        """
-        Updates any events for the passed in contact field
-        """
-        if not contact_field.is_active:
-            # remove any scheduled fires for the passed in field
-            EventFire.objects.filter(event__relative_to=contact_field, fired=None).delete()
-        else:
-            # cancel existing events, we are going to recreate them all
-            EventFire.objects.filter(event__relative_to=contact_field, fired=None).delete()
-
-            now = timezone.now()
-
-            org = contact_field.org
-            events = CampaignEvent.objects.filter(
-                relative_to=contact_field, campaign__is_active=True, campaign__is_archived=False, is_active=True
-            ).prefetch_related("relative_to")
-            for event in events:
-                field = event.relative_to
-                field_uuid = str(field.uuid)
-
-                contacts = (
-                    event.campaign.group.contacts.filter(is_active=True, is_blocked=False)
-                    .exclude(is_test=True)
-                    .extra(
-                        where=['%s::text[] <@ (extract_jsonb_keys("contacts_contact"."fields"))'],
-                        params=[[field_uuid]],
-                    )
-                )
-
-                events = []
-                for contact in contacts:
-                    contact.org = org
-                    scheduled = event.calculate_scheduled_fire_for_value(contact.get_field_value(field), now)
-
-                    # and if we have a date, then schedule it
-                    if scheduled:
-                        events.append(EventFire(event=event, contact=contact, scheduled=scheduled))
-
-                # bulk create our event fires
-                EventFire.objects.bulk_create(events)
 
     @classmethod
     def update_events_for_contact_groups(cls, contact, groups):
@@ -746,7 +696,7 @@ class EventFire(Model):
             scheduled = event.calculate_scheduled_fire(contact)
 
             # and if we have a date, then schedule it
-            if scheduled and not contact.is_test:
+            if scheduled:
                 EventFire.objects.create(event=event, contact=contact, scheduled=scheduled)
 
     @classmethod
@@ -766,7 +716,7 @@ class EventFire(Model):
                 scheduled = event.calculate_scheduled_fire(contact)
 
                 # and if we have a date, then schedule it
-                if scheduled and not contact.is_test:
+                if scheduled:
                     EventFire.objects.create(event=event, contact=contact, scheduled=scheduled)
 
     def __str__(self):

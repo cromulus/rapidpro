@@ -1,13 +1,12 @@
-
 import os
 import re
 from datetime import timedelta
 from platform import python_version
+from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
 import nexmo
 from django_redis import get_redis_connection
-from mock import MagicMock, patch
 
 from django.conf import settings
 from django.contrib.auth.models import Group
@@ -19,9 +18,8 @@ from django.utils.encoding import force_text
 import celery.exceptions
 from celery import current_app
 
-from temba.channels.models import Channel, ChannelLog, ChannelSession
-from temba.contacts.models import Contact
-from temba.flows.models import ActionLog, Flow, FlowRevision, FlowRun
+from temba.channels.models import Channel, ChannelConnection, ChannelLog
+from temba.flows.models import Flow, FlowRevision, FlowRun
 from temba.ivr.tasks import check_calls_task, start_call_task
 from temba.msgs.models import IVR, OUTGOING, PENDING, Msg
 from temba.orgs.models import get_current_export_version
@@ -56,9 +54,7 @@ class IVRTests(FlowFileTest):
     @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
     @patch("twilio.request_validator.RequestValidator", MockRequestValidator)
     def test_preferred_channel(self, mock_update_call, mock_create_call, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_create_call.return_value = dict(uuid="12345")
         mock_update_call.return_value = dict(uuid="12345")
 
@@ -116,41 +112,6 @@ class IVRTests(FlowFileTest):
         call = IVRCall.objects.all().last()
         self.assertEqual(IVRCall.WIRED, call.status)
         self.assertEqual("NX", call.channel.channel_type)
-
-    @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
-    @patch("twilio.request_validator.RequestValidator", MockRequestValidator)
-    def test_twilio_failed_auth(self):
-        def create(self, to=None, from_=None, url=None, status_callback=None):
-            from twilio.base.exceptions import TwilioRestException
-
-            raise TwilioRestException(403, "http://twilio.com", code=20003)
-
-        original_mock_calls_create = MockTwilioClient.MockCalls.create
-        MockTwilioClient.MockCalls.create = create
-
-        # connect it and check our client is configured
-        self.org.connect_twilio("TEST_SID", "TEST_TOKEN", self.admin)
-        self.org.save()
-
-        # import an ivr flow
-        self.import_file("call_me_maybe")
-        flow = Flow.objects.filter(name="Call me maybe").first()
-
-        user_settings = self.admin.get_settings()
-        user_settings.tel = "+18005551212"
-        user_settings.save()
-
-        test_contact = Contact.get_test_contact(self.admin)
-        Contact.set_simulation(True)
-        flow.start([], [test_contact])
-
-        log = ActionLog.objects.all().order_by("-pk").first()
-        self.assertEqual(
-            log.text, "Call ended. Could not authenticate with your Twilio account. " "Check your token and try again."
-        )
-
-        # restore old mock_calls_create
-        MockTwilioClient.MockCalls.create = original_mock_calls_create
 
     def test_twiml_client(self):
         # no twiml api config yet
@@ -230,9 +191,7 @@ class IVRTests(FlowFileTest):
     @patch("nexmo.Client.create_application")
     @patch("nexmo.Client.create_call")
     def test_disable_calls_nexmo(self, mock_create_call, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_create_call.return_value = dict(uuid="12345")
 
         with self.settings(SEND_CALLS=False):
@@ -266,7 +225,7 @@ class IVRTests(FlowFileTest):
 
         # post to a bogus call id
         post_data = dict(CallSid="CallSid", CallStatus="in-progress", CallDuration=20)
-        response = self.client.post(reverse("ivr.ivrcall_handle", args=[999999999]), post_data)
+        response = self.client.post(reverse("ivr.ivrcall_handle", args=[999_999_999]), post_data)
         self.assertEqual(404, response.status_code)
 
         # start a real call
@@ -355,13 +314,13 @@ class IVRTests(FlowFileTest):
 
         # we should have played a recording from the contact back to them
         outbound_msg = messages[1]
-        self.assertTrue(outbound_msg.attachments[0].startswith("audio/x-wav:https://"))
+        self.assertTrue(outbound_msg.attachments[0].startswith("audio/x-wav:http://"))
         self.assertTrue(outbound_msg.attachments[0].endswith(".wav"))
-        self.assertTrue(outbound_msg.text.startswith("https://"))
+        self.assertTrue(outbound_msg.text.startswith("http://"))
         self.assertTrue(outbound_msg.text.endswith(".wav"))
 
         media_msg = messages[2]
-        self.assertTrue(media_msg.attachments[0].startswith("audio/x-wav:https://"))
+        self.assertTrue(media_msg.attachments[0].startswith("audio/x-wav:http://"))
         self.assertTrue(media_msg.attachments[0].endswith(".wav"))
         self.assertEqual("Played contact recording", media_msg.text)
 
@@ -380,47 +339,10 @@ class IVRTests(FlowFileTest):
         self.assertEqual(len(run.path), 4)
         self.assertEqual(len(run.get_messages()), 4)
 
-        # run same flow in simulator
-        Contact.set_simulation(True)
-        test_contact = Contact.get_test_contact(self.admin)
-        flow.start([], [test_contact])
-        test_call = IVRCall.objects.get(direction=IVRCall.OUTGOING, contact=test_contact)
-
-        self.client.post(
-            reverse("ivr.ivrcall_handle", args=[test_call.id]),
-            {"CallSid": "CallSid", "CallStatus": "in-progress", "CallDuration": 20},
-        )
-
-        with patch("requests.get") as response:
-            response.side_effect = (
-                MockResponse(404, "No such file"),
-                MockResponse(200, "Fake Recording Bits", {"Content-Type": "audio/x-wav"}),
-            )
-            self.client.post(
-                reverse("ivr.ivrcall_handle", args=[test_call.id]),
-                {
-                    "CallStatus": "completed",
-                    "Digits": "hangup",
-                    "RecordingUrl": "http://api.twilio.com/ASID/Recordings/SID",
-                    "RecordingSid": "FAKESID",
-                },
-            )
-
-        out_msg = Msg.objects.get(
-            contact=test_contact, direction="O", msg_type="V", text__contains="Played contact recording"
-        )
-        recording_url = out_msg.attachments[0].split(":", 1)[1]
-
-        self.assertTrue(ActionLog.objects.filter(text="Played recording at &quot;%s&quot;" % recording_url).exists())
-
     @patch("jwt.encode")
     @patch("nexmo.Client.create_application")
-    @patch("requests.post")
-    def test_ivr_recording_with_nexmo(self, mock_create_call, mock_create_application, mock_jwt):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
-        mock_create_call.return_value = MockResponse(200, json.dumps(dict(uuid="12345")))
+    def test_ivr_recording_with_nexmo(self, mock_create_application, mock_jwt):
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_jwt.return_value = b"Encoded data"
 
         # connect Nexmo
@@ -435,7 +357,12 @@ class IVRTests(FlowFileTest):
 
         # start our flow
         contact = self.create_contact("Chuck D", number="+13603621737")
-        run, = flow.start([], [contact])
+
+        with patch("requests.post") as mock_create_call:
+            mock_create_call.return_value = MockResponse(200, json.dumps(dict(uuid="12345")))
+
+            run, = flow.start([], [contact])
+
         call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).first()
 
         callback_url = reverse("ivr.ivrcall_handle", args=[call.pk])
@@ -536,13 +463,13 @@ class IVRTests(FlowFileTest):
 
         # we should have played a recording from the contact back to them
         outbound_msg = messages[1]
-        self.assertTrue(outbound_msg.attachments[0].startswith("audio/x-wav:https://"))
+        self.assertTrue(outbound_msg.attachments[0].startswith("audio/x-wav:http://"))
         self.assertTrue(outbound_msg.attachments[0].endswith(".wav"))
-        self.assertTrue(outbound_msg.text.startswith("https://"))
+        self.assertTrue(outbound_msg.text.startswith("http://"))
         self.assertTrue(outbound_msg.text.endswith(".wav"))
 
         media_msg = messages[2]
-        self.assertTrue(media_msg.attachments[0].startswith("audio/x-wav:https://"))
+        self.assertTrue(media_msg.attachments[0].startswith("audio/x-wav:http://"))
         self.assertTrue(media_msg.attachments[0].endswith(".wav"))
         self.assertEqual("Played contact recording", media_msg.text)
 
@@ -562,31 +489,35 @@ class IVRTests(FlowFileTest):
         self.assertEqual(len(run.get_messages()), 4)
 
         # create a valid call first
-        flow.start([], [contact], restart_participants=True)
+        with patch("requests.post") as mock_create_call:
+            mock_create_call.return_value = MockResponse(200, json.dumps(dict(uuid="12345")))
+
+            flow.start([], [contact], restart_participants=True)
 
         # now create an errored call
-        mock_create_call.side_effect = Exception("Kab00m!")
-        nexmo_client = self.org.get_nexmo_client()
-        with self.assertRaises(IVRException):
-            nexmo_client.start_call(call, "+13603621737", self.channel.address, None)
+        with patch("requests.post") as mock_create_call:
+            mock_create_call.side_effect = Exception("Kab00m!")
+            nexmo_client = self.org.get_nexmo_client()
+            with self.assertRaises(IVRException):
+                nexmo_client.start_call(call, "+13603621737", self.channel.address, None)
 
         call.refresh_from_db()
-        self.assertEqual(ChannelSession.FAILED, call.status)
+        self.assertEqual(ChannelConnection.FAILED, call.status)
 
         # check that our channel logs are there
-        response = self.client.get(reverse("channels.channellog_list") + "?channel=%d&sessions=1" % self.channel.id)
+        response = self.client.get(reverse("channels.channellog_list", args=[self.channel.uuid]) + "?connections=1")
         self.assertContains(response, "15 seconds")
         self.assertContains(response, "2 results")
 
         # our channel logs with the error flag
         response = self.client.get(
-            reverse("channels.channellog_list") + "?channel=%d&sessions=1&errors=1" % self.channel.id
+            reverse("channels.channellog_list", args=[self.channel.uuid]) + "?connections=1&errors=1"
         )
         self.assertContains(response, "warning")
         self.assertContains(response, "1 result")
 
         # view the errored call read page
-        response = self.client.get(reverse("channels.channellog_session", args=[call.id]))
+        response = self.client.get(reverse("channels.channellog_connection", args=[call.id]))
         self.assertContains(response, "https://api.nexmo.com/v1/calls")
         self.assertContains(response, "Kab00m!")
 
@@ -863,9 +794,7 @@ class IVRTests(FlowFileTest):
     @patch("nexmo.Client.create_application")
     @patch("nexmo.Client.create_call")
     def test_ivr_digital_gather_with_nexmo(self, mock_create_call, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_create_call.return_value = dict(uuid="12345")
 
         self.org.connect_nexmo("123", "456", self.admin)
@@ -893,7 +822,7 @@ class IVRTests(FlowFileTest):
         )
 
         call.refresh_from_db()
-        self.assertEqual(ChannelSession.IN_PROGRESS, call.status)
+        self.assertEqual(ChannelConnection.IN_PROGRESS, call.status)
 
         self.assertTrue(
             dict(action="talk", bargeIn=True, text="Enter your phone number followed by the pound sign.")
@@ -911,12 +840,8 @@ class IVRTests(FlowFileTest):
     @patch("jwt.encode")
     @patch("requests.put")
     @patch("nexmo.Client.create_application")
-    @patch("requests.post")
-    def test_expiration_hangup(self, mock_create_call, mock_create_application, mock_put, mock_jwt):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
-        mock_create_call.return_value = MockResponse(200, json.dumps(dict(call=dict(uuid="12345"))))
+    def test_expiration_hangup(self, mock_create_application, mock_put, mock_jwt):
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_jwt.return_value = b"Encoded data"
 
         request = MagicMock()
@@ -938,12 +863,16 @@ class IVRTests(FlowFileTest):
 
         # start our flow
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
-        flow.start([], [eric])
+
+        with patch("requests.post") as mock_create_call:
+            mock_create_call.return_value = MockResponse(200, json.dumps(dict(call=dict(uuid="12345"))))
+
+            flow.start([], [eric])
 
         # since it hasn't started, our call should be pending and run should have an expiration for the max 7 days
         call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).first()
         run = FlowRun.objects.get()
-        self.assertEqual(ChannelSession.WIRED, call.status)
+        self.assertEqual(ChannelConnection.WIRED, call.status)
         next3days = timezone.now() + timedelta(days=3)
         self.assertTrue(run.expires_on > next3days)
 
@@ -955,7 +884,7 @@ class IVRTests(FlowFileTest):
 
         call.refresh_from_db()
         run.refresh_from_db()
-        self.assertEqual(ChannelSession.IN_PROGRESS, call.status)
+        self.assertEqual(ChannelConnection.IN_PROGRESS, call.status)
         self.assertIsNotNone(run.expires_on)
 
         # now expire our run
@@ -964,7 +893,7 @@ class IVRTests(FlowFileTest):
 
         mock_put.assert_called()
         call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).first()
-        self.assertEqual(ChannelSession.INTERRUPTED, call.status)
+        self.assertEqual(ChannelConnection.INTERRUPTED, call.status)
 
         # call initiation, answer, and timeout should both be logged
         self.assertEqual(4, ChannelLog.objects.filter(connection=call).count())
@@ -973,9 +902,7 @@ class IVRTests(FlowFileTest):
     @patch("nexmo.Client.create_application")
     @patch("nexmo.Client.create_call")
     def test_ivr_subflow_with_nexmo(self, mock_create_call, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_create_call.return_value = dict(uuid="12345")
 
         self.org.connect_nexmo("123", "456", self.admin)
@@ -1060,26 +987,6 @@ class IVRTests(FlowFileTest):
 
     @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
     @patch("twilio.request_validator.RequestValidator", MockRequestValidator)
-    def test_ivr_simulation(self):
-
-        # import an ivr flow
-        flow = self.get_flow("call_me_maybe")
-        simulate_url = reverse("flows.flow_simulate", args=[flow.pk])
-        post_data = dict(has_refresh=True, version="1")
-
-        self.login(self.admin)
-        self.client.post(simulate_url, json.dumps(post_data), content_type="application/json")
-        first_call = IVRCall.objects.get(direction=IVRCall.OUTGOING)
-
-        self.client.post(simulate_url, json.dumps(post_data), content_type="application/json")
-        second_call = IVRCall.objects.get(direction=IVRCall.OUTGOING)
-
-        # it should have hung up and deleted our first call and created a new one
-        self.assertFalse(IVRCall.objects.filter(id=first_call.id).exists())
-        self.assertNotEqual(first_call.id, second_call.id)
-
-    @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
-    @patch("twilio.request_validator.RequestValidator", MockRequestValidator)
     def test_ivr_flow(self):
 
         # should be able to create an ivr flow
@@ -1121,58 +1028,7 @@ class IVRTests(FlowFileTest):
         flow = Flow.objects.filter(name="Call me maybe").first()
         self.assertEqual("callme", flow.triggers.filter(trigger_type="K").first().keyword)
 
-        user_settings = self.admin.get_settings()
-        user_settings.tel = "+18005551212"
-        user_settings.save()
-
-        # start our flow as a test contact
-        test_contact = Contact.get_test_contact(self.admin)
-        Contact.set_simulation(True)
-        flow.start([], [test_contact])
-        call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).first()
-
-        self.assertEqual(call.status, IVRCall.WIRED)
-
-        # should be using the usersettings number in test mode
-        self.assertEqual("Placing test call to +1 800-555-1212", ActionLog.objects.all().first().text)
-
-        # our twilio callback on pickup
-        post_data = dict(CallSid="CallSid", CallStatus="in-progress", CallDuration=20)
-        response = self.client.post(reverse("ivr.ivrcall_handle", args=[call.pk]), post_data)
-        call.refresh_from_db()
-        self.assertEqual(timedelta(seconds=20), call.get_duration())
-
-        # force a duration calculation
-        call.duration = None
-        self.assertIsNotNone(call.get_duration())
-
-        # simulate a button press and that our message is handled
-        response = self.client.post(
-            reverse("ivr.ivrcall_handle", args=[call.pk]), dict(CallStatus="in-progress", Digits=4)
-        )
-        msg = Msg.objects.filter(contact=test_contact, text="4", direction="I").first()
-        self.assertIsNotNone(msg)
-        self.assertEqual("H", msg.status)
-
-        # explicitly hanging up on a test call should remove it
-        call.update_status("in-progress", 0, "T")
-        call.save()
-        IVRCall.hangup_test_call(flow)
-        self.assertTrue(IVRCall.objects.filter(pk=call.pk).first())
-
-        msgs = Msg.objects.filter(connection=call).order_by("created_on")
-        self.assertEqual(3, msgs.count())
-        self.assertIn("Would you like me to call you?", msgs[0].text)
-        self.assertEqual("4", msgs[1].text)
-        self.assertEqual("Press one, two, or three. Thanks.", msgs[2].text)
-
-        ActionLog.objects.all().delete()
-        self.releaseIVRCalls()
-        self.releaseMessages()
-
-        # now pretend we are a normal caller
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
-        Contact.set_simulation(False)
         run, = flow.start([], [eric], restart_participants=True)
 
         # we should have an outbound ivr call now
@@ -1244,11 +1100,6 @@ class IVRTests(FlowFileTest):
         self.assertFalse(FlowRun.objects.filter(connection=call).first().is_active)
         self.assertIsNotNone(call.ended_on)
 
-        # simulation gets flipped off by middleware, and this unhandled message doesn't flip it back on
-        self.assertFalse(Contact.get_simulation())
-
-        # also shouldn't have any ActionLogs for non-test users
-        self.assertEqual(0, ActionLog.objects.all().count())
         self.assertEqual(flow.get_run_stats()["completed"], 1)
 
         # should still have no active runs
@@ -1283,15 +1134,13 @@ class IVRTests(FlowFileTest):
         self.assertEqual(len(run.path), 2)
         self.assertIn(out, run.get_messages())
 
-        # try updating our status to completed for a test contact
-        Contact.set_simulation(True)
-        flow.start([], [test_contact])
+        # try updating our status to completed
+        flow.start([], [eric])
         call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).order_by("-pk").first()
         call.update_status("completed", 30, "T")
         call.save()
         call.refresh_from_db()
 
-        self.assertEqual(ActionLog.objects.all().order_by("-pk").first().text, "Call ended.")
         self.assertEqual(call.duration, 30)
 
         # now look at implied duration
@@ -1344,7 +1193,6 @@ class IVRTests(FlowFileTest):
 
         # now pretend we are a normal caller
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
-        Contact.set_simulation(False)
         flow.start([], [eric], restart_participants=True)
 
         # we should have an outbound ivr call now
@@ -1390,12 +1238,8 @@ class IVRTests(FlowFileTest):
         user_settings.save()
 
         # start our flow
-        test_contact = Contact.get_test_contact(self.admin)
-        Contact.set_simulation(True)
-        flow.start([], [test_contact])
-
-        # should be using the usersettings number in test mode
-        self.assertEqual("Placing test call to +1 800-555-1212", ActionLog.objects.all().first().text)
+        eric = self.create_contact("Eric Newcomer", number="+13603621737")
+        flow.start([], [eric])
 
         # we should have an outbound ivr call now
         call = IVRCall.objects.filter(direction=IVRCall.OUTGOING).first()
@@ -1411,7 +1255,7 @@ class IVRTests(FlowFileTest):
 
         # make sure a message from the person on the call goes to the
         # inbox since our flow doesn't handle text messages
-        msg = self.create_msg(direction="I", contact=test_contact, text="message during phone call")
+        msg = self.create_msg(direction="I", contact=eric, text="message during phone call")
         self.assertFalse(Flow.find_and_handle(msg)[0])
 
     @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
@@ -1511,9 +1355,7 @@ class IVRTests(FlowFileTest):
     @patch("nexmo.Client.update_call")
     @patch("nexmo.Client.create_application")
     def test_incoming_start_nexmo(self, mock_create_application, mock_update_call):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
         mock_update_call.return_value = dict(uuid="12345")
 
         self.org.connect_nexmo("123", "456", self.admin)
@@ -1562,9 +1404,7 @@ class IVRTests(FlowFileTest):
 
     @patch("nexmo.Client.create_application")
     def test_incoming_call_nexmo(self, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
 
         self.org.connect_nexmo("123", "456", self.admin)
         self.org.save()
@@ -1685,9 +1525,7 @@ class IVRTests(FlowFileTest):
 
     @patch("nexmo.Client.create_application")
     def test_nexmo_config_empty_callbacks(self, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
 
         self.org.connect_nexmo("123", "456", self.admin)
         self.org.save()
@@ -1720,9 +1558,7 @@ class IVRTests(FlowFileTest):
 
     @patch("nexmo.Client.create_application")
     def test_no_channel_for_call_nexmo(self, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
 
         self.org.connect_nexmo("123", "456", self.admin)
         self.org.save()
@@ -1751,9 +1587,7 @@ class IVRTests(FlowFileTest):
 
     @patch("nexmo.Client.create_application")
     def test_no_flow_for_incoming_nexmo(self, mock_create_application):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
 
         self.org.connect_nexmo("123", "456", self.admin)
         self.org.save()
@@ -1865,9 +1699,8 @@ class IVRTests(FlowFileTest):
     @patch("nexmo.Client.create_application")
     @patch("nexmo.Client.create_call")
     def test_download_media_nexmo(self, mock_create_call, mock_create_application, mock_download_recording):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
+
         mock_create_call.return_value = dict(uuid="12345")
         mock_download_recording.side_effect = [
             MockResponse(200, "SOUND BITS"),
@@ -1933,9 +1766,8 @@ class IVRTests(FlowFileTest):
     @patch("jwt.encode")
     @patch("nexmo.Client.create_application")
     def test_temba_utils_nexmo_methods(self, mock_create_application, mock_jwt_encode):
-        mock_create_application.return_value = bytes(
-            json.dumps(dict(id="app-id", keys=dict(private_key="private-key\n"))), encoding="utf-8"
-        )
+        mock_create_application.return_value = dict(id="app-id", keys=dict(private_key="private-key\n"))
+
         mock_jwt_encode.return_value = b"TOKEN"
 
         self.org.connect_nexmo("123", "456", self.admin)
@@ -1985,10 +1817,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=0,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.NO_ANSWER,
@@ -2001,10 +1830,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=IVRCall.MAX_RETRY_ATTEMPTS - 1,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.BUSY,
@@ -2019,10 +1845,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=IVRCall.MAX_RETRY_ATTEMPTS + 1,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.BUSY,
@@ -2036,10 +1859,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=0,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.IN_PROGRESS,
@@ -2054,10 +1874,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=0,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.NO_ANSWER,
@@ -2067,7 +1884,7 @@ class IVRTests(FlowFileTest):
         )
 
         call5.modified_on = timezone.now() - timedelta(IVRCall.IGNORE_PENDING_CALLS_OLDER_THAN_DAYS + 14)
-        call5.save(update_fields=("modified_on",), preserve_modified_on=True)
+        call5.save(update_fields=("modified_on",))
 
         self.assertTrue(
             all((call1.next_attempt, call2.next_attempt, call3.next_attempt, call4.next_attempt, call5.next_attempt))
@@ -2110,12 +1927,7 @@ class IVRTests(FlowFileTest):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
         call1 = IVRCall.objects.create(
-            channel=self.channel,
-            org=self.org,
-            contact=a_contact,
-            contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
+            channel=self.channel, org=self.org, contact=a_contact, contact_urn=a_contact.urns.first()
         )
 
         self.assertIsNone(call1.next_attempt)
@@ -2144,12 +1956,7 @@ class IVRTests(FlowFileTest):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
         call1 = IVRCall.objects.create(
-            channel=self.channel,
-            org=self.org,
-            contact=a_contact,
-            contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
+            channel=self.channel, org=self.org, contact=a_contact, contact_urn=a_contact.urns.first()
         )
 
         def _get_flow():
@@ -2193,12 +2000,7 @@ class IVRTests(FlowFileTest):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
         call1 = IVRCall.objects.create(
-            channel=self.channel,
-            org=self.org,
-            contact=a_contact,
-            contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
+            channel=self.channel, org=self.org, contact=a_contact, contact_urn=a_contact.urns.first()
         )
 
         def _get_flow():
@@ -2275,12 +2077,7 @@ class IVRTests(FlowFileTest):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
         call1 = IVRCall.objects.create(
-            channel=self.channel,
-            org=self.org,
-            contact=a_contact,
-            contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
+            channel=self.channel, org=self.org, contact=a_contact, contact_urn=a_contact.urns.first()
         )
 
         # status is None
@@ -2292,31 +2089,21 @@ class IVRTests(FlowFileTest):
     def test_create_outgoing_implicit_values(self):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
-        call = IVRCall.create_outgoing(
-            channel=self.channel, contact=a_contact, contact_urn=a_contact.urns.first(), user=self.admin
-        )
+        call = IVRCall.create_outgoing(channel=self.channel, contact=a_contact, contact_urn=a_contact.urns.first())
 
         self.assertEqual(call.direction, IVRCall.OUTGOING)
         self.assertEqual(call.org, self.org)
-        self.assertEqual(call.created_by, self.admin)
-        self.assertEqual(call.modified_by, self.admin)
         self.assertEqual(call.status, IVRCall.PENDING)
 
     def test_create_incoming_implicit_values(self):
         a_contact = self.create_contact("Eric Newcomer", number="+13603621737")
 
         call = IVRCall.create_incoming(
-            channel=self.channel,
-            contact=a_contact,
-            contact_urn=a_contact.urns.first(),
-            user=self.admin,
-            external_id="an_external_id",
+            channel=self.channel, contact=a_contact, contact_urn=a_contact.urns.first(), external_id="an_external_id"
         )
 
         self.assertEqual(call.direction, IVRCall.INCOMING)
         self.assertEqual(call.org, self.org)
-        self.assertEqual(call.created_by, self.admin)
-        self.assertEqual(call.modified_by, self.admin)
         self.assertEqual(call.status, IVRCall.PENDING)
 
     def test_nexmo_derive_ivr_status(self):
@@ -2360,10 +2147,7 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
-            is_active=True,
             retry_count=0,
             next_attempt=timezone.now() - timedelta(days=180),
             status=IVRCall.NO_ANSWER,
@@ -2407,7 +2191,6 @@ class IVRTests(FlowFileTest):
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
         not_eric = self.create_contact("Not Eric Newcomer", number="+13603621738")
         also_not_eric = self.create_contact("Also Not Eric Newcomer", number="+13603621739")
-        Contact.set_simulation(False)
 
         channel_key = Channel.redis_active_events_key(channel.id)
 
@@ -2417,8 +2200,8 @@ class IVRTests(FlowFileTest):
         # start the flow
         flow.start([], [eric, not_eric, also_not_eric])
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         # we should have an wired ivr call now
         self.assertEqual(started_calls.count(), 1)
@@ -2438,8 +2221,8 @@ class IVRTests(FlowFileTest):
         # simulate task_enqueue_call_events
         current_app.send_task("task_enqueue_call_events", args=[], kwargs={})
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         # one of the calls terminated, so we can enqueue another call
         self.assertEqual(started_calls.count(), 1)
@@ -2455,8 +2238,8 @@ class IVRTests(FlowFileTest):
         # simulate task_enqueue_call_events
         current_app.send_task("task_enqueue_call_events", args=[], kwargs={})
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         # call is still in progress so we can't enqueue a new call
         self.assertEqual(started_calls.count(), 0)
@@ -2474,8 +2257,8 @@ class IVRTests(FlowFileTest):
         # simulate task_enqueue_call_events
         current_app.send_task("task_enqueue_call_events", args=[], kwargs={})
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         # enqueue a new call
         self.assertEqual(started_calls.count(), 1)
@@ -2517,8 +2300,6 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
         )
         call2 = IVRCall.objects.create(
@@ -2526,8 +2307,6 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
         )
 
@@ -2540,9 +2319,9 @@ class IVRTests(FlowFileTest):
         call1.save()
 
         # there should be a failed call
-        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(failed_calls.count(), 1)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
         self.assertEqual(pending_calls.count(), 1)
 
         # but we are not trying to retry it
@@ -2552,7 +2331,7 @@ class IVRTests(FlowFileTest):
         current_app.send_task("check_failed_calls_task", args=[], kwargs={})
 
         # failed call retry is not active, and there are no queued calls
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.QUEUED)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.QUEUED)
         self.assertEqual(started_calls.count(), 0)
 
         # enable failed call retry on the channel
@@ -2568,18 +2347,18 @@ class IVRTests(FlowFileTest):
         self.assertEqual(call1.error_count, 1)
 
         # there should be a failed call
-        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(failed_calls.count(), 2)
 
         # simulate async task to enqueue pending failed calls
         current_app.send_task("check_failed_calls_task", args=[], kwargs={})
 
         # there are no failed calls
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(pending_calls.count(), 0)
 
         # and there is one queued call
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
         self.assertEqual(started_calls.count(), 2)
 
         # should not be able to retry a call that has failed too many times
@@ -2589,18 +2368,18 @@ class IVRTests(FlowFileTest):
         call1.update_status("failed", 0, "T")
         call1.save()
 
-        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(failed_calls.count(), 1)
 
         # simulate async task to enqueue pending failed calls
         current_app.send_task("check_failed_calls_task", args=[], kwargs={})
 
         # the call is still in failed state because we are over the failed_call_retry limit
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(pending_calls.count(), 1)
 
         # and there is still one queued call
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
         self.assertEqual(started_calls.count(), 1)
 
     @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
@@ -2623,8 +2402,6 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
         )
         call2 = IVRCall.objects.create(
@@ -2632,8 +2409,6 @@ class IVRTests(FlowFileTest):
             org=self.org,
             contact=a_contact,
             contact_urn=a_contact.urns.first(),
-            created_by=self.admin,
-            modified_by=self.admin,
             direction=IVRCall.OUTGOING,
         )
 
@@ -2646,28 +2421,28 @@ class IVRTests(FlowFileTest):
         call2.update_status("failed", 0, "T")
         call2.save()
         call2.modified_on = call2.modified_on - timedelta(days=IVRCall.IGNORE_PENDING_CALLS_OLDER_THAN_DAYS + 14)
-        call2.save(update_fields=("modified_on",), preserve_modified_on=True)
+        call2.save(update_fields=("modified_on",))
 
         # failed retry count
         self.assertEqual(call1.error_count, 1)
         self.assertEqual(call2.error_count, 1)
 
         # there should be a failed call
-        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        failed_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(failed_calls.count(), 2)
 
         # simulate async task to enqueue pending failed calls
         current_app.send_task("check_failed_calls_task", args=[], kwargs={})
 
         # there is a failed call older than desired working window
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.FAILED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.FAILED)
         self.assertEqual(pending_calls.count(), 1)
 
         call2.refresh_from_db()
         self.assertEqual(call2.status, IVRCall.FAILED)
 
         # and there is one queued call
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
         self.assertEqual(started_calls.count(), 1)
 
     @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
@@ -2697,7 +2472,6 @@ class IVRTests(FlowFileTest):
         # create contacts
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
         not_eric = self.create_contact("Not Eric Newcomer", number="+13603621738")
-        Contact.set_simulation(False)
 
         channel_key = Channel.redis_active_events_key(channel.id)
 
@@ -2707,8 +2481,8 @@ class IVRTests(FlowFileTest):
         # start the flow
         flow.start([], [eric, not_eric])
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         self.assertEqual(started_calls.count(), 1)
         self.assertEqual(pending_calls.count(), 1)
@@ -2725,9 +2499,9 @@ class IVRTests(FlowFileTest):
 
         current_app.send_task("task_enqueue_call_events", args=[], kwargs={})
 
-        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.WIRED)
-        queued_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.QUEUED)
-        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelSession.PENDING)
+        started_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.WIRED)
+        queued_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.QUEUED)
+        pending_calls = IVRCall.objects.filter(direction=IVRCall.OUTGOING, status=ChannelConnection.PENDING)
 
         # will not enqueue a call if the channel is not active
         self.assertEqual(started_calls.count(), 0)
@@ -2776,7 +2550,6 @@ class IVRTests(FlowFileTest):
 
         # create contact
         eric = self.create_contact("Eric Newcomer", number="+13603621737")
-        Contact.set_simulation(False)
 
         # start the flow
         flow.start([], [eric])
@@ -2810,3 +2583,7 @@ class IVRTests(FlowFileTest):
         call.refresh_from_db()
 
         self.assertEqual(call.status, IVRCall.FAILED)
+
+    def test_mailroom_ivr_view(self):
+        response = self.client.get(reverse("mailroom.ivr_handler", args=[self.channel.uuid, "incoming"]))
+        self.assertEqual(500, response.status_code)
