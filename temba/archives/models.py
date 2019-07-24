@@ -81,7 +81,7 @@ class Archive(models.Model):
         session = boto3.Session(
             aws_access_key_id=settings.AWS_ACCESS_KEY_ID, aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
         )
-        return session.client("s3")
+        return session.client("s3", endpoint_url=settings.AWS_ENDPOINT)
 
     @classmethod
     def release_org_archives(cls, org):
